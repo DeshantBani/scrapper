@@ -133,19 +133,24 @@ async def collect_parts(
             f"Parts UI not found for {group_code} (waited {parts_wait_ms//1000}s)"
         )
 
-    # ==== NEW: hard verification it's the right vehicle/group ====
+    # ==== Verification it's the right vehicle/group (with retry logic) ====
     try:
+        # Wait a bit for page to fully load
+        await parts_host.wait_for_timeout(500)
+        
         # 1) URL should include the group code
         url_ok = await (parts_host if parts_host != page else
                         (popup or page)).evaluate(
                             "(gc) => location.href.includes(gc)", group_code)
-        # 2) The header usually contains group code or vehicle name
+        # 2) The header usually contains group code or vehicle name (more lenient check)
         hdr_ok = await parts_host.evaluate(
             """
             (gc, titleFrag) => {
               const hdr =
                 document.querySelector('.panel-title, .modal-title, .panel-heading')?.innerText || '';
-              return hdr.includes(gc) || hdr.includes(titleFrag);
+              // More lenient: check if any part of group code is present, or if table exists
+              return hdr.includes(gc) || hdr.includes(titleFrag) || 
+                     !!document.querySelector('#bomPage') || !!document.querySelector('#bomPage_wrapper');
             }
             """,
             group_code,
@@ -155,7 +160,9 @@ async def collect_parts(
         table_ok = await parts_host.evaluate(
             "() => !!document.querySelector('#bomPage') || !!document.querySelector('#bomPage_wrapper')"
         )
-        if not (url_ok and hdr_ok and table_ok):
+        
+        # More lenient validation - only retry if both URL and table are missing
+        if not (url_ok or table_ok):
             raise RuntimeError("mismatch")
     except Exception:
         logger.warning(

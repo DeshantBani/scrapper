@@ -30,109 +30,161 @@ class DataStore:
             return [r[1] for r in cur.fetchall()]
 
         with sqlite3.connect(self.sqlite_path) as conn:
-            # --- checkpoints (unchanged) ---
+            # --- checkpoints ---
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS checkpoints (
-                vehicle_id TEXT,
-                group_type TEXT,
-                table_no   TEXT,
-                group_code TEXT,
-                status     TEXT,      -- 'pending' | 'done' | 'error'
-                row_count  INTEGER,
-                image_saved INTEGER,   -- 0/1
-                last_error TEXT,
-                updated_at TEXT,
-                PRIMARY KEY (vehicle_id, group_type, table_no, group_code)
+                  vehicle_id  TEXT,
+                  group_type  TEXT,
+                  table_no    TEXT,
+                  group_code  TEXT,
+                  status      TEXT,      -- 'pending' | 'done' | 'error'
+                  row_count   INTEGER,
+                  image_saved INTEGER,   -- 0/1
+                  last_error  TEXT,
+                  updated_at  TEXT,
+                  PRIMARY KEY (vehicle_id, group_type, table_no, group_code)
                 )
             """)
 
-        # --- vehicles (unchanged) ---
+            # --- vehicles ---
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS vehicles (
-                vehicle_id   TEXT PRIMARY KEY,
-                vehicle_name TEXT,
-                model_code   TEXT,
-                source_url   TEXT,
-                created_at   TEXT
-            )
+                  vehicle_id   TEXT PRIMARY KEY,
+                  vehicle_name TEXT,
+                  model_code   TEXT,
+                  source_url   TEXT,
+                  created_at   TEXT
+                )
             """)
 
-        # --- parts_pages (ensure full schema) ---
+            # --- milestones (for progress visibility) ---
             conn.execute("""
-            CREATE TABLE IF NOT EXISTS parts_pages (
-                vehicle_id     TEXT,
-                group_type     TEXT,
-                table_no       TEXT,
-                group_code     TEXT,
-                parts_page_url TEXT,
-                image_path     TEXT,
-                updated_at     TEXT,
-                PRIMARY KEY (vehicle_id, group_type, table_no, group_code)
-            )
+                CREATE TABLE IF NOT EXISTS milestones (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  batch_no INTEGER,
+                  upto_vehicle_id TEXT,
+                  created_at TEXT
+                )
             """)
 
-        # Migrate parts_pages if it exists w/out updated_at
+            # --- simple meta bucket (future-proof) ---
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS meta (
+                  key TEXT PRIMARY KEY,
+                  value TEXT
+                )
+            """)
+
+            # --- parts_pages (ensure full schema) ---
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS parts_pages (
+                  vehicle_id     TEXT,
+                  group_type     TEXT,
+                  table_no       TEXT,
+                  group_code     TEXT,
+                  parts_page_url TEXT,
+                  image_path     TEXT,
+                  updated_at     TEXT,
+                  PRIMARY KEY (vehicle_id, group_type, table_no, group_code)
+                )
+            """)
             cols = column_names(conn, "parts_pages")
             if "updated_at" not in cols:
-                conn.execute("ALTER TABLE parts_pages ADD COLUMN updated_at TEXT")
+                conn.execute(
+                    "ALTER TABLE parts_pages ADD COLUMN updated_at TEXT")
 
-        # --- parts (ensure full schema used by save_part_rows) ---
+            # --- parts (canonical storage) ---
             conn.execute("""
-            CREATE TABLE IF NOT EXISTS parts (
-                vehicle_id     TEXT,
-                vehicle_name   TEXT,
-                model_code     TEXT,
-                group_type     TEXT,
-                table_no       TEXT,
-                group_code     TEXT,
-                group_desc     TEXT,
-                ref_no         TEXT,
-                part_no        TEXT,
-                description    TEXT,
-                remark         TEXT,
-                req_no         TEXT,
-                moq            TEXT,
-                mrp            TEXT,
-                parts_page_url TEXT,
-                image_path     TEXT,
-                source_url     TEXT,
-                created_at     TEXT
-            )
+                CREATE TABLE IF NOT EXISTS parts (
+                  vehicle_id     TEXT,
+                  vehicle_name   TEXT,
+                  model_code     TEXT,
+                  group_type     TEXT,
+                  table_no       TEXT,
+                  group_code     TEXT,
+                  group_desc     TEXT,
+                  ref_no         TEXT,
+                  part_no        TEXT,
+                  description    TEXT,
+                  remark         TEXT,
+                  req_no         TEXT,
+                  moq            TEXT,
+                  mrp            TEXT,
+                  parts_page_url TEXT,
+                  image_path     TEXT,
+                  source_url     TEXT,
+                  created_at     TEXT
+                )
             """)
-
-        # Migrate parts table if it was created with fewer columns
             parts_cols = set(column_names(conn, "parts"))
-            needed = {
-                "vehicle_name", "model_code", "group_desc", "parts_page_url",
-                "image_path", "source_url", "created_at"
-            }
             add_map = {
-            "vehicle_name":   "ALTER TABLE parts ADD COLUMN vehicle_name TEXT",
-            "model_code":     "ALTER TABLE parts ADD COLUMN model_code TEXT",
-            "group_desc":     "ALTER TABLE parts ADD COLUMN group_desc TEXT",
-            "parts_page_url": "ALTER TABLE parts ADD COLUMN parts_page_url TEXT",
-            "image_path":     "ALTER TABLE parts ADD COLUMN image_path TEXT",
-            "source_url":     "ALTER TABLE parts ADD COLUMN source_url TEXT",
-            "created_at":     "ALTER TABLE parts ADD COLUMN created_at TEXT",
+                "vehicle_name":
+                "ALTER TABLE parts ADD COLUMN vehicle_name TEXT",
+                "model_code": "ALTER TABLE parts ADD COLUMN model_code TEXT",
+                "group_desc": "ALTER TABLE parts ADD COLUMN group_desc TEXT",
+                "parts_page_url":
+                "ALTER TABLE parts ADD COLUMN parts_page_url TEXT",
+                "image_path": "ALTER TABLE parts ADD COLUMN image_path TEXT",
+                "source_url": "ALTER TABLE parts ADD COLUMN source_url TEXT",
+                "created_at": "ALTER TABLE parts ADD COLUMN created_at TEXT",
             }
-            for col in needed:
+            for col, sql in add_map.items():
                 if col not in parts_cols:
-                    conn.execute(add_map[col])
+                    conn.execute(sql)
 
-                    # Ensure a unique constraint that matches our ON CONFLICT target
-        # (vehicle_id, group_type, table_no, group_code, ref_no, part_no)
+            # Unique constraint for idempotent upserts
             conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS parts_unique_idx
                 ON parts (vehicle_id, group_type, table_no, group_code, ref_no, part_no)
             """)
 
-
             conn.commit()
 
+    # ----------------------- MILESTONES / META ---------------------------
+
+    def mark_milestone(self, batch_no: int, upto_vehicle_id: str):
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.execute(
+                "INSERT INTO milestones (batch_no, upto_vehicle_id, created_at) VALUES (?, ?, ?)",
+                (batch_no, upto_vehicle_id, datetime.now().isoformat()),
+            )
+            conn.commit()
+
+    def get_vehicle_group_status_counts(self, vehicle_id: str) -> dict:
+        with sqlite3.connect(self.sqlite_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT status, COUNT(*) FROM checkpoints
+                WHERE vehicle_id = ?
+                GROUP BY status
+            """, (vehicle_id, ))
+            rows = cur.fetchall()
+        return {k: v for k, v in rows}
+
+    def is_vehicle_complete(self, vehicle_id: str,
+                            expected_groups: int) -> bool:
+        """True if exactly expected_groups checkpoints exist and all are 'done'."""
+        with sqlite3.connect(self.sqlite_path) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM checkpoints WHERE vehicle_id = ?
+            """, (vehicle_id, ))
+            total = cur.fetchone()[0] or 0
+
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM checkpoints WHERE vehicle_id = ? AND status = 'done'
+            """, (vehicle_id, ))
+            done = cur.fetchone()[0] or 0
+
+        return (total == expected_groups) and (done == expected_groups)
 
     # ----------------------- CHECKPOINTS ---------------------------------
 
-    def checkpoint_status(self, key: Tuple[str, str, str, str]) -> Optional[str]:
+    def checkpoint_status(self, key: Tuple[str, str, str,
+                                           str]) -> Optional[str]:
         """Get checkpoint status for (vehicle_id, group_type, table_no, group_code)."""
         vehicle_id, group_type, table_no, group_code = key
         with sqlite3.connect(self.sqlite_path) as conn:
@@ -144,27 +196,35 @@ class DataStore:
             result = cursor.fetchone()
             return result[0] if result else None
 
-    def checkpoint_mark_done(self, key: Tuple[str, str, str, str], row_count: int, image_saved: bool):
+    def checkpoint_mark_done(self, key: Tuple[str, str, str, str],
+                             row_count: int, image_saved: bool):
         """Mark checkpoint as done."""
         vehicle_id, group_type, table_no, group_code = key
         with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT OR REPLACE INTO checkpoints
                 (vehicle_id, group_type, table_no, group_code, status, row_count, image_saved, last_error, updated_at)
                 VALUES (?, ?, ?, ?, 'done', ?, ?, NULL, ?)
-            """, (vehicle_id, group_type, table_no, group_code, row_count, int(image_saved), datetime.now().isoformat()))
+            """, (vehicle_id, group_type, table_no, group_code, row_count,
+                  int(image_saved), datetime.now().isoformat()))
             conn.commit()
-        logger.info(f"Checkpoint marked done: {key} ({row_count} rows, image_saved={image_saved})")
+        logger.info(
+            f"Checkpoint marked done: {key} ({row_count} rows, image_saved={image_saved})"
+        )
 
-    def checkpoint_mark_error(self, key: Tuple[str, str, str, str], error: str):
+    def checkpoint_mark_error(self, key: Tuple[str, str, str, str],
+                              error: str):
         """Mark checkpoint as error."""
         vehicle_id, group_type, table_no, group_code = key
         with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT OR REPLACE INTO checkpoints
                 (vehicle_id, group_type, table_no, group_code, status, row_count, image_saved, last_error, updated_at)
                 VALUES (?, ?, ?, ?, 'error', NULL, 0, ?, ?)
-            """, (vehicle_id, group_type, table_no, group_code, error, datetime.now().isoformat()))
+            """, (vehicle_id, group_type, table_no, group_code, error,
+                  datetime.now().isoformat()))
             conn.commit()
         logger.error(f"Checkpoint marked error: {key} - {error}")
 
@@ -172,11 +232,13 @@ class DataStore:
         """Mark checkpoint as pending."""
         vehicle_id, group_type, table_no, group_code = key
         with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT OR REPLACE INTO checkpoints
                 (vehicle_id, group_type, table_no, group_code, status, row_count, image_saved, last_error, updated_at)
                 VALUES (?, ?, ?, ?, 'pending', NULL, 0, NULL, ?)
-            """, (vehicle_id, group_type, table_no, group_code, datetime.now().isoformat()))
+            """, (vehicle_id, group_type, table_no, group_code,
+                  datetime.now().isoformat()))
             conn.commit()
 
     # ----------------------- VEHICLES -----------------------------------
@@ -184,21 +246,29 @@ class DataStore:
     def save_vehicle(self, vehicle: Vehicle):
         """Save vehicle to database."""
         with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT OR REPLACE INTO vehicles
                 (vehicle_id, vehicle_name, model_code, source_url, created_at)
                 VALUES (?, ?, ?, ?, ?)
-            """, (vehicle.vehicle_id, vehicle.vehicle_name, vehicle.model_code, vehicle.source_url, datetime.now().isoformat()))
+            """, (vehicle.vehicle_id, vehicle.vehicle_name, vehicle.model_code,
+                  vehicle.source_url, datetime.now().isoformat()))
             conn.commit()
 
     def get_vehicles(self) -> List[Vehicle]:
         """Get all saved vehicles."""
         with sqlite3.connect(self.sqlite_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT vehicle_id, vehicle_name, model_code, source_url FROM vehicles")
+            cursor.execute(
+                "SELECT vehicle_id, vehicle_name, model_code, source_url FROM vehicles"
+            )
             vehicles = []
             for row in cursor.fetchall():
-                vehicles.append(Vehicle(vehicle_id=row[0], vehicle_name=row[1], model_code=row[2], source_url=row[3]))
+                vehicles.append(
+                    Vehicle(vehicle_id=row[0],
+                            vehicle_name=row[1],
+                            model_code=row[2],
+                            source_url=row[3]))
             return vehicles
 
     # ------------------- UPSERT PARTS & PAGES ---------------------------
@@ -209,18 +279,18 @@ class DataStore:
 
     def upsert_parts_page(self, parts_page: PartsPage):
         with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO parts_pages (vehicle_id, group_type, table_no, group_code, parts_page_url, image_path, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(vehicle_id, group_type, table_no, group_code)
                 DO UPDATE SET parts_page_url=excluded.parts_page_url,
                               image_path=excluded.image_path,
                               updated_at=excluded.updated_at
-            """, (
-                parts_page.vehicle_id, parts_page.group_type, parts_page.table_no,
-                parts_page.group_code, parts_page.parts_page_url,
-                parts_page.image_path or '', datetime.now().isoformat()
-            ))
+            """, (parts_page.vehicle_id, parts_page.group_type,
+                  parts_page.table_no, parts_page.group_code,
+                  parts_page.parts_page_url, parts_page.image_path or '',
+                  datetime.now().isoformat()))
             conn.commit()
 
     def upsert_part_rows(self, dict_rows: List[dict]) -> int:
@@ -228,7 +298,8 @@ class DataStore:
         if not dict_rows:
             return 0
         with sqlite3.connect(self.sqlite_path) as conn:
-            conn.executemany("""
+            conn.executemany(
+                """
                 INSERT INTO parts (
                   vehicle_id, group_type, table_no, group_code,
                   ref_no, part_no, description, remark, req_no, moq, mrp,
@@ -244,19 +315,20 @@ class DataStore:
                               image_path=excluded.image_path,
                               parts_page_url=excluded.parts_page_url,
                               source_url=excluded.source_url
-            """, [(
-                d['vehicle_id'], d['group_type'], d['table_no'], d['group_code'],
-                d.get('ref_no',''), d.get('part_no',''),
-                d.get('description',''), d.get('remark',''),
-                d.get('req_no',''), d.get('moq',''), d.get('mrp',''),
-                d.get('image_path',''), d.get('parts_page_url',''), d.get('source_url','')
-            ) for d in dict_rows])
+            """, [(d['vehicle_id'], d['group_type'], d['table_no'],
+                   d['group_code'], d.get('ref_no', ''), d.get(
+                       'part_no', ''), d.get('description', ''),
+                   d.get('remark', ''), d.get('req_no', ''), d.get(
+                       'moq', ''), d.get('mrp', ''), d.get('image_path', ''),
+                   d.get('parts_page_url', ''), d.get('source_url', ''))
+                  for d in dict_rows])
             conn.commit()
         return len(dict_rows)
 
     # ---------------- CSV / Parquet (group-scoped write) ----------------
 
-    def _fetch_group_df(self, vehicle_id: str, group_type: str, table_no: str, group_code: str) -> pd.DataFrame:
+    def _fetch_group_df(self, vehicle_id: str, group_type: str, table_no: str,
+                        group_code: str) -> pd.DataFrame:
         """Read the canonical rows for a group from SQLite."""
         with sqlite3.connect(self.sqlite_path) as conn:
             df = pd.read_sql_query("""
@@ -266,11 +338,15 @@ class DataStore:
                 FROM parts
                 WHERE vehicle_id=? AND group_type=? AND table_no=? AND group_code=?
                 ORDER BY CAST(NULLIF(ref_no, '') AS INT) NULLS LAST, ref_no
-            """, conn, params=(vehicle_id, group_type, table_no, group_code))
+            """,
+                                   conn,
+                                   params=(vehicle_id, group_type, table_no,
+                                           group_code))
         # Ensure column order matches schema used elsewhere
         df = df.reindex(columns=[
-            'vehicle_id','group_type','table_no','group_code','ref_no','part_no',
-            'description','remark','req_no','moq','mrp','image_path','parts_page_url','source_url'
+            'vehicle_id', 'group_type', 'table_no', 'group_code', 'ref_no',
+            'part_no', 'description', 'remark', 'req_no', 'moq', 'mrp',
+            'image_path', 'parts_page_url', 'source_url'
         ])
         return df
 
@@ -278,38 +354,41 @@ class DataStore:
         """Write/refresh a group's rows into the CSV without creating duplicates."""
         config.CSV_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
         if config.CSV_OUTPUT.exists():
-            existing = pd.read_csv(config.CSV_OUTPUT, dtype=str).fillna('')
-            mask = (
-                (existing['vehicle_id'] == df_group['vehicle_id'].iloc[0]) &
-                (existing['group_type'] == df_group['group_type'].iloc[0]) &
-                (existing['table_no'] == df_group['table_no'].iloc[0]) &
-                (existing['group_code'] == df_group['group_code'].iloc[0])
-            )
+            existing_path = config.CSV_OUTPUT
+        else:
+            existing_path = config.CSV_OUTPUT
+
+        if existing_path.exists():
+            existing = pd.read_csv(existing_path, dtype=str).fillna('')
+            mask = ((existing['vehicle_id'] == df_group['vehicle_id'].iloc[0])
+                    &
+                    (existing['group_type'] == df_group['group_type'].iloc[0])
+                    & (existing['table_no'] == df_group['table_no'].iloc[0]) &
+                    (existing['group_code'] == df_group['group_code'].iloc[0]))
             existing = existing.loc[~mask]
             out = pd.concat([existing, df_group], ignore_index=True)
         else:
             out = df_group
-        # Stable column order
+        # Stable column order (attempt to include richer schema if present)
         desired_cols = [
-            'vehicle_id','vehicle_name','model_code','group_type','table_no','group_code','group_desc',
-            'ref_no','part_no','description','remark','req_no','moq','mrp',
-            'image_path','parts_page_url','source_url'
+            'vehicle_id', 'vehicle_name', 'model_code', 'group_type',
+            'table_no', 'group_code', 'group_desc', 'ref_no', 'part_no',
+            'description', 'remark', 'req_no', 'moq', 'mrp', 'image_path',
+            'parts_page_url', 'source_url'
         ]
-        # If file already had the wider schema from convert_parts_to_dict_list, try to align
         if set(desired_cols).issubset(out.columns):
             out = out[desired_cols]
-        out.to_csv(config.CSV_OUTPUT, index=False)
+        out.to_csv(existing_path, index=False)
 
     def _overwrite_group_in_parquet(self, df_group: pd.DataFrame):
         config.PARQUET_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
         try:
             existing = pd.read_parquet(config.PARQUET_OUTPUT)
-            mask = (
-                (existing['vehicle_id'] == df_group['vehicle_id'].iloc[0]) &
-                (existing['group_type'] == df_group['group_type'].iloc[0]) &
-                (existing['table_no'] == df_group['table_no'].iloc[0]) &
-                (existing['group_code'] == df_group['group_code'].iloc[0])
-            )
+            mask = ((existing['vehicle_id'] == df_group['vehicle_id'].iloc[0])
+                    &
+                    (existing['group_type'] == df_group['group_type'].iloc[0])
+                    & (existing['table_no'] == df_group['table_no'].iloc[0]) &
+                    (existing['group_code'] == df_group['group_code'].iloc[0]))
             existing = existing.loc[~mask]
             out = pd.concat([existing, df_group], ignore_index=True)
         except Exception:
@@ -330,33 +409,54 @@ class DataStore:
         UPSERT part rows for a group and immediately write that group's rows to CSV (and Parquet if requested),
         replacing previous rows for the group to avoid duplicates on re-runs.
         """
+        if not part_rows:
+            return 0
+
         # Convert to dict list for DB write
-        dict_rows = self.convert_parts_to_dict_list(vehicle, table_index, parts_page, part_rows)
+        dict_rows = self.convert_parts_to_dict_list(vehicle, table_index,
+                                                    parts_page, part_rows)
 
         # UPSERT into DB (dedup canonical storage)
         upserted = self.upsert_part_rows(dict_rows)
 
         if write_csv or save_parquet:
             # Re-fetch canonical rows for this group from DB (ensures we write exactly what's in DB)
-            df_group = self._fetch_group_df(vehicle.vehicle_id, table_index.group_type, table_index.table_no, table_index.group_code)
+            df_group = self._fetch_group_df(vehicle.vehicle_id,
+                                            table_index.group_type,
+                                            table_index.table_no,
+                                            table_index.group_code)
 
             # Enrich with vehicle & group_desc if available in the converted dicts
             if not df_group.empty:
-                # Try to add vehicle_name/model_code/group_desc from the converted rows (all are same per group)
-                vname = dict_rows[0].get('vehicle_name', vehicle.vehicle_name) if dict_rows else vehicle.vehicle_name
-                mcode = dict_rows[0].get('model_code', vehicle.model_code) if dict_rows else vehicle.model_code
-                gdesc = dict_rows[0].get('group_desc', getattr(table_index, 'group_desc', ''))
-                df_group.insert(1, 'vehicle_name', vname)
-                df_group.insert(2, 'model_code', mcode)
-                df_group.insert(6, 'group_desc', gdesc)
+                vname = dict_rows[0].get('vehicle_name', vehicle.vehicle_name)
+                mcode = dict_rows[0].get('model_code', vehicle.model_code)
+                gdesc = dict_rows[0].get(
+                    'group_desc', getattr(table_index, 'group_desc', ''))
+                # insert at fixed positions if missing
+                if 'vehicle_name' not in df_group.columns:
+                    df_group.insert(1, 'vehicle_name', vname)
+                else:
+                    df_group['vehicle_name'] = vname
+                if 'model_code' not in df_group.columns:
+                    df_group.insert(2, 'model_code', mcode)
+                else:
+                    df_group['model_code'] = mcode
+                if 'group_desc' not in df_group.columns:
+                    df_group.insert(6, 'group_desc', gdesc)
+                else:
+                    df_group['group_desc'] = gdesc
 
             if write_csv:
                 self._overwrite_group_in_csv(df_group)
-                logger.info(f"CSV updated for group {table_index.group_type} {table_index.table_no} ({len(df_group)} rows)")
+                logger.info(
+                    f"CSV updated for group {table_index.group_type} {table_index.table_no} ({len(df_group)} rows)"
+                )
 
             if save_parquet:
                 self._overwrite_group_in_parquet(df_group)
-                logger.info(f"Parquet updated for group {table_index.group_type} {table_index.table_no} ({len(df_group)} rows)")
+                logger.info(
+                    f"Parquet updated for group {table_index.group_type} {table_index.table_no} ({len(df_group)} rows)"
+                )
 
         return upserted
 
@@ -366,7 +466,8 @@ class DataStore:
         with sqlite3.connect(self.sqlite_path) as conn:
             cursor = conn.cursor()
             stats = {}
-            cursor.execute("SELECT status, COUNT(*) FROM checkpoints GROUP BY status")
+            cursor.execute(
+                "SELECT status, COUNT(*) FROM checkpoints GROUP BY status")
             for status, count in cursor.fetchall():
                 stats[f"{status}_count"] = count
             cursor.execute("SELECT COUNT(*) FROM checkpoints")
@@ -375,7 +476,6 @@ class DataStore:
             stats['total_vehicles'] = cursor.fetchone()[0]
             return stats
 
-    # (Kept for compatibility if used elsewhere)
     def write_parts_csv(self, parts_data: List[dict], append: bool = True):
         """Legacy: writes arbitrary rows; prefer append_parts_rows() per-group instead."""
         if not parts_data:
@@ -384,8 +484,12 @@ class DataStore:
         df = pd.DataFrame(parts_data)
         df = df.reindex(columns=PART_ROW_HEADERS, fill_value='')
         mode = 'a' if (append and config.CSV_OUTPUT.exists()) else 'w'
-        df.to_csv(config.CSV_OUTPUT, mode=mode, header=(mode == 'w'), index=False)
-        logger.info(f"Wrote {len(parts_data)} parts to CSV: {config.CSV_OUTPUT}")
+        df.to_csv(config.CSV_OUTPUT,
+                  mode=mode,
+                  header=(mode == 'w'),
+                  index=False)
+        logger.info(
+            f"Wrote {len(parts_data)} parts to CSV: {config.CSV_OUTPUT}")
 
     def write_parts_parquet(self, parts_data: List[dict], append: bool = True):
         """Legacy: writes arbitrary rows; prefer append_parts_rows() per-group instead."""
@@ -400,29 +504,34 @@ class DataStore:
             combined_df.to_parquet(config.PARQUET_OUTPUT, index=False)
         else:
             df.to_parquet(config.PARQUET_OUTPUT, index=False)
-        logger.info(f"Wrote {len(parts_data)} parts to Parquet: {config.PARQUET_OUTPUT}")
+        logger.info(
+            f"Wrote {len(parts_data)} parts to Parquet: {config.PARQUET_OUTPUT}"
+        )
 
-    def convert_parts_to_dict_list(self, vehicle: Vehicle, table_index: TableIndex, parts_page: PartsPage, part_rows: List[PartRow]) -> List[dict]:
+    def convert_parts_to_dict_list(self, vehicle: Vehicle,
+                                   table_index: TableIndex,
+                                   parts_page: PartsPage,
+                                   part_rows: List[PartRow]) -> List[dict]:
         """Convert parts data to dictionary list for CSV/Parquet output."""
         result = []
         for part_row in part_rows:
             result.append({
-                'vehicle_id'     : vehicle.vehicle_id,
-                'vehicle_name'   : vehicle.vehicle_name,
-                'model_code'     : vehicle.model_code,
-                'group_type'     : table_index.group_type,
-                'table_no'       : table_index.table_no,
-                'group_code'     : table_index.group_code,
-                'group_desc'     : getattr(table_index, 'group_desc', ''),
-                'ref_no'         : part_row.ref_no,
-                'part_no'        : part_row.part_no,
-                'description'    : part_row.description,
-                'remark'         : part_row.remark,
-                'req_no'         : part_row.req_no,
-                'moq'            : part_row.moq,
-                'mrp'            : part_row.mrp,
-                'image_path'     : parts_page.image_path or '',
-                'parts_page_url' : parts_page.parts_page_url,
-                'source_url'     : vehicle.source_url
+                'vehicle_id': vehicle.vehicle_id,
+                'vehicle_name': vehicle.vehicle_name,
+                'model_code': vehicle.model_code,
+                'group_type': table_index.group_type,
+                'table_no': table_index.table_no,
+                'group_code': table_index.group_code,
+                'group_desc': getattr(table_index, 'group_desc', ''),
+                'ref_no': part_row.ref_no,
+                'part_no': part_row.part_no,
+                'description': part_row.description,
+                'remark': part_row.remark,
+                'req_no': part_row.req_no,
+                'moq': part_row.moq,
+                'mrp': part_row.mrp,
+                'image_path': parts_page.image_path or '',
+                'parts_page_url': parts_page.parts_page_url,
+                'source_url': vehicle.source_url
             })
         return result
